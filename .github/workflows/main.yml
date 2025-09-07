@@ -1,4 +1,4 @@
-name: Build AbyssVideoDownloader
+name: Build AbyssVideoDownloader (GraalVM Portable EXE)
 
 on:
   push:
@@ -15,113 +15,97 @@ env:
   APP_NAME: AbyssVideoDownloader
   APP_VERSION: 1.5.13
   TAG_NAME: v1.5.13
-  JAR_NAME: abyss-dl.jar
   PROJECT_DIR: AbyssVideoDownloader
+  UBER_JAR: abyss-dl-all.jar
 
 jobs:
-  build_linux:
-    name: Build JAR (Ubuntu)
-    runs-on: ubuntu-latest
+  build_windows_portable:
+    name: Build Portable EXE (Windows, GraalVM)
+    runs-on: windows-latest
     permissions:
       contents: write
-    steps:
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
-        with:
-          java-version: '21'
-          distribution: 'temurin'
 
-      - name: Checkout
+    steps:
+      - name: Checkout (this repo)
         uses: actions/checkout@v4
 
-      - name: Clone Repository
-        run: |
-          git clone https://github.com/abdlhay/AbyssVideoDownloader.git
-          cd $PROJECT_DIR
-          echo "Cloned."
-
-      - name: Make Gradle Executable
-        run: chmod +x $PROJECT_DIR/gradlew
-
-      - name: Build
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: ./gradlew clean build
-
-      - name: Collect artifacts
-        run: |
-          mkdir -p out/linux
-          cp $PROJECT_DIR/build/libs/${JAR_NAME} out/linux/${JAR_NAME}
-
-      - name: Upload artifact (JAR)
-        uses: actions/upload-artifact@v4
-        with:
-          name: linux-jar
-          path: out/linux/${{ env.JAR_NAME }}
-          if-no-files-found: error
-
-  build_windows:
-    name: Build EXE (Windows)
-    runs-on: windows-latest
-    needs: build_linux
-    steps:
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
-        with:
-          java-version: '21'
-          distribution: 'temurin'
-
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Clone Repository
+      - name: Clone source project
         shell: bash
         run: |
           git clone https://github.com/abdlhay/AbyssVideoDownloader.git
 
-      - name: Build (Gradle)
-        working-directory: ${{ env.PROJECT_DIR }}
-        shell: bash
-        run: |
-          ./gradlew.bat clean build
+      - name: Set up GraalVM (Java 21) with Native Image
+        uses: graalvm/setup-graalvm@v1
+        with:
+          java-version: '21'
+          distribution: 'graalvm'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          components: 'native-image'
 
-      # If your JAR includes Main-Class in MANIFEST.MF, --main-class is optional.
-      # If not, add: --main-class your.package.Main
-      - name: Package EXE with jpackage
+      # Native Image on Windows requires MSVC toolchain available on PATH
+      - name: Set up MSVC developer command prompt
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            %USERPROFILE%\.gradle\caches
+            %USERPROFILE%\.gradle\wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Build (Gradle) — produce uber/fat JAR
         working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
-          mkdir -p build/dist
-          jpackage \
-            --type exe \
-            --name "${APP_NAME}" \
-            --app-version "${APP_VERSION}" \
-            --input "build/libs" \
-            --main-jar "${JAR_NAME}" \
-            --dest "build/dist" \
-            --win-dir-chooser \
-            --win-menu \
-            --win-shortcut
-          ls -la build/dist
+          # If the project already includes Shadow, this will emit *-all.jar.
+          # Otherwise, add the Shadow plugin in build.gradle before running CI.
+          ./gradlew.bat --no-daemon clean shadowJar
+          ls -la build/libs
+
+      - name: Prepare output folders
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          mkdir -p build/native
+
+      - name: Build native EXE with GraalVM Native Image
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          # Use the fat jar as input to native-image
+          native-image ^
+            --no-fallback ^
+            --enable-http ^
+            --enable-https ^
+            -H:Name=${{ env.APP_NAME }} ^
+            -H:Path=build/native ^
+            -jar build/libs/${{ env.UBER_JAR }}
+
+          echo "Produced files:"
+          dir build\native
 
       - name: Collect artifacts
         shell: bash
         run: |
           mkdir -p out/windows
-          cp "${PROJECT_DIR}/build/dist/${APP_NAME}-${APP_VERSION}.exe" "out/windows/${APP_NAME}-${APP_VERSION}.exe" 2>/dev/null || \
-          cp "${PROJECT_DIR}/build/dist/${APP_NAME}.exe" "out/windows/${APP_NAME}.exe"
+          cp "${{ env.PROJECT_DIR }}/build/native/${{ env.APP_NAME }}.exe" "out/windows/${{ env.APP_NAME }}-${{ env.APP_VERSION }}.exe"
 
-      - name: Upload artifact (EXE)
+      - name: Upload artifact (Portable EXE)
         uses: actions/upload-artifact@v4
         with:
-          name: windows-exe
-          path: |
-            out/windows/*.exe
+          name: windows-exe-portable
+          path: out/windows/*.exe
           if-no-files-found: error
 
   release:
     name: Create Draft Release
     runs-on: ubuntu-latest
-    needs: [ build_linux, build_windows ]
+    needs: [ build_windows_portable ]
     permissions:
       contents: write
     steps:
@@ -137,8 +121,7 @@ jobs:
         uses: softprops/action-gh-release@v2.0.6
         with:
           tag_name: ${{ env.TAG_NAME }}
-          name: ${{ env.APP_NAME }}-v${{ github.run_number }}
+          name: AbyssVideoDownloader-v${{ github.run_number }}
           draft: true
           files: |
-            dist/linux-jar/${{ env.JAR_NAME }}
-            dist/windows-exe/*.exe
+            dist/windows-exe-portable/*.exe
